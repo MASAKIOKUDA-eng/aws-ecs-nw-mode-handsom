@@ -1,0 +1,636 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ECS network mode lab - platform layer.
+  ECS cluster, IAM roles, ECR, internal ALB + target groups, EC2 capacity (B1/B2/C/D), load generator.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: netmode-lab
+    AllowedPattern: "^[a-z0-9-]{3,20}$"
+  InstanceType:
+    Type: String
+    Default: c6i.large
+    Description: Same type for B1/B2/C/D. Check it is in the ENI trunking supported list.
+  LoadgenInstanceType:
+    Type: String
+    Default: c6i.xlarge
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+  LoadgenAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  CapacityB1:
+    Type: Number
+    Default: 2
+  CapacityB2:
+    Type: Number
+    Default: 0
+    Description: Keep 0 until awsvpcTrunking is enabled, then raise (only new instances get trunk ENIs).
+  CapacityC:
+    Type: Number
+    Default: 2
+  CapacityD:
+    Type: Number
+    Default: 2
+  SingleAz:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Put all container instances in AZ-a for fair comparison (cross-AZ tests use the load generator in AZ-b).
+  AppLogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+
+Conditions:
+  IsSingleAz: !Equals [!Ref SingleAz, "true"]
+
+Resources:
+  # ---------------------------------------------------------------- ECS cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Prefix
+      ClusterSettings:
+        - { Name: containerInsights, Value: enhanced }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders:
+        - FARGATE
+        - !Ref CpB1
+        - !Ref CpB2
+        - !Ref CpC
+        - !Ref CpD
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1 }
+
+  # ---------------------------------------------------------------- ECR
+  NetbenchRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefix}/netbench"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: KMS }
+      EmptyOnDelete: true
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  LoadgenRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefix}/loadgen"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: KMS }
+      EmptyOnDelete: true
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # ---------------------------------------------------------------- Logs
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Prefix}/app"
+      RetentionInDays: !Ref AppLogRetentionDays
+
+  EcsEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/events/${Prefix}-ecs"
+      RetentionInDays: !Ref AppLogRetentionDays
+
+  EcsEventsLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${Prefix}-ecs-events"
+      PolicyDocument: !Sub |
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"${EcsEventsLogGroup.Arn}","Condition":{"StringEquals":{"aws:SourceAccount":"${AWS::AccountId}"}}}]}
+
+  # Keep ECS task / service / deployment events so DevOps Agent (and we) can read them later.
+  EcsEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Prefix}-ecs-events"
+      EventPattern:
+        source: [aws.ecs]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+      Targets:
+        - Id: logs
+          Arn: !GetAtt EcsEventsLogGroup.Arn
+
+  # ---------------------------------------------------------------- IAM
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # The app does not call AWS APIs: the task role has no permissions on purpose.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LoadgenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: pull-loadgen-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt LoadgenRepo.Arn
+
+  LoadgenInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref LoadgenRole]
+
+  # ---------------------------------------------------------------- Internal ALB
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Prefix}-alb"
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }
+        - !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }
+      SecurityGroups:
+        - !ImportValue { "Fn::Sub": "${Prefix}-AlbSg" }
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # One target group + one listener port per pattern so metrics never mix.
+  TgA:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-a"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !ImportValue { "Fn::Sub": "${Prefix}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: NetMode, Value: A }
+  TgB1:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-b1"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !ImportValue { "Fn::Sub": "${Prefix}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: NetMode, Value: B1 }
+  TgB2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-b2"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !ImportValue { "Fn::Sub": "${Prefix}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: NetMode, Value: B2 }
+  TgC:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-c"
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !ImportValue { "Fn::Sub": "${Prefix}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: NetMode, Value: C }
+  TgD:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-d"
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !ImportValue { "Fn::Sub": "${Prefix}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: NetMode, Value: D }
+
+  ListenerA:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8001
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TgA }]
+  ListenerB1:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8002
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TgB1 }]
+  ListenerB2:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8003
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TgB2 }]
+  ListenerC:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8004
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TgC }]
+  ListenerD:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8005
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TgD }]
+
+  # ---------------------------------------------------------------- EC2 capacity
+  # IMDSv2 required, hop limit 1 (blocks bridge containers from IMDS).
+  # awsvpc tasks are blocked from IMDS with ECS_AWSVPC_BLOCK_IMDS.
+  # host mode containers CAN still reach IMDS - this is one of the comparison points.
+  LtB1:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!ImportValue { "Fn::Sub": "${Prefix}-Ec2AwsvpcHostSg" }]
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Prefix}-b1" }
+              - { Key: Project, Value: !Ref Prefix }
+              - { Key: NetMode, Value: B1 }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat <<'EOF' >> /etc/ecs/ecs.config
+            ECS_CLUSTER=${Prefix}
+            ECS_AWSVPC_BLOCK_IMDS=true
+            ECS_ENABLE_CONTAINER_METADATA=true
+            ECS_INSTANCE_ATTRIBUTES={"netmode-pool":"B1"}
+            EOF
+  LtB2:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!ImportValue { "Fn::Sub": "${Prefix}-Ec2AwsvpcHostSg" }]
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Prefix}-b2" }
+              - { Key: Project, Value: !Ref Prefix }
+              - { Key: NetMode, Value: B2 }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat <<'EOF' >> /etc/ecs/ecs.config
+            ECS_CLUSTER=${Prefix}
+            ECS_AWSVPC_BLOCK_IMDS=true
+            ECS_ENABLE_CONTAINER_METADATA=true
+            ECS_INSTANCE_ATTRIBUTES={"netmode-pool":"B2"}
+            EOF
+  LtC:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!ImportValue { "Fn::Sub": "${Prefix}-Ec2BridgeSg" }]
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Prefix}-c" }
+              - { Key: Project, Value: !Ref Prefix }
+              - { Key: NetMode, Value: C }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat <<'EOF' >> /etc/ecs/ecs.config
+            ECS_CLUSTER=${Prefix}
+            ECS_ENABLE_CONTAINER_METADATA=true
+            ECS_INSTANCE_ATTRIBUTES={"netmode-pool":"C"}
+            EOF
+  LtD:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!ImportValue { "Fn::Sub": "${Prefix}-Ec2HostSg" }]
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Prefix}-d" }
+              - { Key: Project, Value: !Ref Prefix }
+              - { Key: NetMode, Value: D }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat <<'EOF' >> /etc/ecs/ecs.config
+            ECS_CLUSTER=${Prefix}
+            ECS_ENABLE_CONTAINER_METADATA=true
+            ECS_INSTANCE_ATTRIBUTES={"netmode-pool":"D"}
+            EOF
+
+  AsgB1:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Cluster   # delete instances before the cluster
+    Properties:
+      AutoScalingGroupName: !Sub "${Prefix}-b1"
+      MinSize: "0"
+      MaxSize: "10"
+      DesiredCapacity: !Ref CapacityB1
+      LaunchTemplate: { LaunchTemplateId: !Ref LtB1, Version: !GetAtt LtB1.LatestVersionNumber }
+      VPCZoneIdentifier: !If
+        - IsSingleAz
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }, !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix, PropagateAtLaunch: true }
+  AsgB2:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Cluster   # delete instances before the cluster
+    Properties:
+      AutoScalingGroupName: !Sub "${Prefix}-b2"
+      MinSize: "0"
+      MaxSize: "10"
+      DesiredCapacity: !Ref CapacityB2
+      LaunchTemplate: { LaunchTemplateId: !Ref LtB2, Version: !GetAtt LtB2.LatestVersionNumber }
+      VPCZoneIdentifier: !If
+        - IsSingleAz
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }, !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix, PropagateAtLaunch: true }
+  AsgC:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Cluster   # delete instances before the cluster
+    Properties:
+      AutoScalingGroupName: !Sub "${Prefix}-c"
+      MinSize: "0"
+      MaxSize: "10"
+      DesiredCapacity: !Ref CapacityC
+      LaunchTemplate: { LaunchTemplateId: !Ref LtC, Version: !GetAtt LtC.LatestVersionNumber }
+      VPCZoneIdentifier: !If
+        - IsSingleAz
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }, !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix, PropagateAtLaunch: true }
+  AsgD:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Cluster   # delete instances before the cluster
+    Properties:
+      AutoScalingGroupName: !Sub "${Prefix}-d"
+      MinSize: "0"
+      MaxSize: "10"
+      DesiredCapacity: !Ref CapacityD
+      LaunchTemplate: { LaunchTemplateId: !Ref LtD, Version: !GetAtt LtD.LatestVersionNumber }
+      VPCZoneIdentifier: !If
+        - IsSingleAz
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+        - [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }, !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix, PropagateAtLaunch: true }
+
+  # Managed scaling is off: the number of instances is fixed so that results are comparable.
+  CpB1:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "${Prefix}-cp-b1"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AsgB1
+        ManagedScaling: { Status: DISABLED }
+        ManagedTerminationProtection: DISABLED
+  CpB2:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "${Prefix}-cp-b2"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AsgB2
+        ManagedScaling: { Status: DISABLED }
+        ManagedTerminationProtection: DISABLED
+  CpC:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "${Prefix}-cp-c"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AsgC
+        ManagedScaling: { Status: DISABLED }
+        ManagedTerminationProtection: DISABLED
+  CpD:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "${Prefix}-cp-d"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AsgD
+        ManagedScaling: { Status: DISABLED }
+        ManagedTerminationProtection: DISABLED
+
+  # ---------------------------------------------------------------- Load generator (AZ-b, SSM only)
+  Loadgen:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LoadgenAmiId
+      InstanceType: !Ref LoadgenInstanceType
+      IamInstanceProfile: !Ref LoadgenInstanceProfile
+      SubnetId: !ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetB" }
+      SecurityGroupIds: [!ImportValue { "Fn::Sub": "${Prefix}-LoadgenSg" }]
+      MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # Amazon Linux 2023 repositories are reachable through the S3 gateway endpoint.
+          dnf install -y docker jq
+          systemctl enable --now docker
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-loadgen" }
+        - { Key: Project, Value: !Ref Prefix }
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${Prefix}-ClusterName" }
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: !Sub "${Prefix}-TaskExecutionRoleArn" }
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+    Export: { Name: !Sub "${Prefix}-TaskRoleArn" }
+  AppLogGroupName:
+    Value: !Ref AppLogGroup
+    Export: { Name: !Sub "${Prefix}-AppLogGroup" }
+  NetbenchRepoUri:
+    Value: !GetAtt NetbenchRepo.RepositoryUri
+  LoadgenRepoUri:
+    Value: !GetAtt LoadgenRepo.RepositoryUri
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AlbFullName:
+    Value: !GetAtt Alb.LoadBalancerFullName
+    Export: { Name: !Sub "${Prefix}-AlbFullName" }
+  TgA:
+    Value: !Ref TgA
+    Export: { Name: !Sub "${Prefix}-TgA" }
+  TgB1:
+    Value: !Ref TgB1
+    Export: { Name: !Sub "${Prefix}-TgB1" }
+  TgB2:
+    Value: !Ref TgB2
+    Export: { Name: !Sub "${Prefix}-TgB2" }
+  TgC:
+    Value: !Ref TgC
+    Export: { Name: !Sub "${Prefix}-TgC" }
+  TgD:
+    Value: !Ref TgD
+    Export: { Name: !Sub "${Prefix}-TgD" }
+  TgAFullName:
+    Value: !GetAtt TgA.TargetGroupFullName
+    Export: { Name: !Sub "${Prefix}-TgAFullName" }
+  TgB1FullName:
+    Value: !GetAtt TgB1.TargetGroupFullName
+    Export: { Name: !Sub "${Prefix}-TgB1FullName" }
+  TgB2FullName:
+    Value: !GetAtt TgB2.TargetGroupFullName
+    Export: { Name: !Sub "${Prefix}-TgB2FullName" }
+  TgCFullName:
+    Value: !GetAtt TgC.TargetGroupFullName
+    Export: { Name: !Sub "${Prefix}-TgCFullName" }
+  TgDFullName:
+    Value: !GetAtt TgD.TargetGroupFullName
+    Export: { Name: !Sub "${Prefix}-TgDFullName" }
+  CpB1:
+    Value: !Ref CpB1
+    Export: { Name: !Sub "${Prefix}-CpB1" }
+  CpB2:
+    Value: !Ref CpB2
+    Export: { Name: !Sub "${Prefix}-CpB2" }
+  CpC:
+    Value: !Ref CpC
+    Export: { Name: !Sub "${Prefix}-CpC" }
+  CpD:
+    Value: !Ref CpD
+    Export: { Name: !Sub "${Prefix}-CpD" }
+  LoadgenInstanceId:
+    Value: !Ref Loadgen

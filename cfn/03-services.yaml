@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  ECS network mode lab - task definitions, services and alarms for patterns
+  A (Fargate awsvpc), B1 (EC2 awsvpc), B2 (EC2 awsvpc + ENI trunking), C (EC2 bridge), D (EC2 host).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: netmode-lab
+    AllowedPattern: "^[a-z0-9-]{3,20}$"
+  NetbenchImage:
+    Type: String
+    Description: Full image URI. Use a digest, e.g. 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/netmode-lab/netbench@sha256:...
+    AllowedPattern: "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/.+$"
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+  TaskMemory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+  DesiredA:
+    Type: Number
+    Default: 2
+  DesiredB1:
+    Type: Number
+    Default: 2
+  DesiredB2:
+    Type: Number
+    Default: 0
+  DesiredC:
+    Type: Number
+    Default: 2
+  DesiredD:
+    Type: Number
+    Default: 2
+  EnableFaultInjection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Adds pidMode=task and enableFaultInjection=true to A/B1/B2/D for AWS FIS network actions.
+      Bridge mode (C) is not supported by the FIS ECS network actions, so C is left unchanged.
+  LatencyAlarmSeconds:
+    Type: Number
+    Default: 0.5
+    Description: p99 TargetResponseTime threshold.
+
+Conditions:
+  FaultInjection: !Equals [!Ref EnableFaultInjection, "true"]
+
+Mappings:
+  # Values used by the per-pattern alarms below.
+  Patterns:
+    A:  { Service: svc-a,  TgExport: TgAFullName }
+    B1: { Service: svc-b1, TgExport: TgB1FullName }
+    B2: { Service: svc-b2, TgExport: TgB2FullName }
+    C:  { Service: svc-c,  TgExport: TgCFullName }
+    D:  { Service: svc-d,  TgExport: TgDFullName }
+
+Resources:
+  # ================================================================ Task definitions
+  # Two containers per task:
+  #   web   : nginx (non-root) on 8080, static payloads /health /1k /100k /1m
+  #   iperf : iperf3 server on 5201
+  # Both run as non-root, with a read-only root filesystem and all Linux capabilities dropped.
+
+  TdAwsvpcFargate:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-a-fargate-awsvpc"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskExecutionRoleArn" }
+      TaskRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskRoleArn" }
+      PidMode: !If [FaultInjection, task, !Ref "AWS::NoValue"]
+      EnableFaultInjection: !If [FaultInjection, true, !Ref "AWS::NoValue"]
+      Volumes:
+        - Name: web-tmp
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref NetbenchImage
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          MountPoints: [{ SourceVolume: web-tmp, ContainerPath: /tmp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: a
+        - Name: iperf
+          Image: !Ref NetbenchImage
+          Essential: false
+          Command: ["iperf3", "-s", "-p", "5201"]
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 5201, Protocol: tcp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: a
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: A }
+
+  TdAwsvpcEc2:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-b-ec2-awsvpc"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskExecutionRoleArn" }
+      TaskRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskRoleArn" }
+      PidMode: !If [FaultInjection, task, !Ref "AWS::NoValue"]
+      EnableFaultInjection: !If [FaultInjection, true, !Ref "AWS::NoValue"]
+      Volumes:
+        - Name: web-tmp
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref NetbenchImage
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          MountPoints: [{ SourceVolume: web-tmp, ContainerPath: /tmp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: b
+        - Name: iperf
+          Image: !Ref NetbenchImage
+          Essential: false
+          Command: ["iperf3", "-s", "-p", "5201"]
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 5201, Protocol: tcp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: b
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  TdBridge:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-c-ec2-bridge"
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskExecutionRoleArn" }
+      TaskRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskRoleArn" }
+      Volumes:
+        - Name: web-tmp
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref NetbenchImage
+          Essential: true
+          ReadonlyRootFilesystem: true
+          # hostPort 0 = dynamic host port (32768-65535 range is opened to the ALB on the instance SG)
+          PortMappings: [{ ContainerPort: 8080, HostPort: 0, Protocol: tcp }]
+          MountPoints: [{ SourceVolume: web-tmp, ContainerPath: /tmp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: c
+        - Name: iperf
+          Image: !Ref NetbenchImage
+          Essential: false
+          Command: ["iperf3", "-s", "-p", "5201"]
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 5201, HostPort: 0, Protocol: tcp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: c
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: C }
+
+  TdHost:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-d-ec2-host"
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskExecutionRoleArn" }
+      TaskRoleArn: !ImportValue { "Fn::Sub": "${Prefix}-TaskRoleArn" }
+      PidMode: !If [FaultInjection, task, !Ref "AWS::NoValue"]
+      EnableFaultInjection: !If [FaultInjection, true, !Ref "AWS::NoValue"]
+      Volumes:
+        - Name: web-tmp
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref NetbenchImage
+          Essential: true
+          ReadonlyRootFilesystem: true
+          # host mode: the container port IS the host port (only one such task per instance)
+          PortMappings: [{ ContainerPort: 8080, HostPort: 8080, Protocol: tcp }]
+          MountPoints: [{ SourceVolume: web-tmp, ContainerPath: /tmp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: d
+        - Name: iperf
+          Image: !Ref NetbenchImage
+          Essential: false
+          Command: ["iperf3", "-s", "-p", "5201"]
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ ContainerPort: 5201, HostPort: 5201, Protocol: tcp }]
+          LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: [ALL] } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue { "Fn::Sub": "${Prefix}-AppLogGroup" }
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: d
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: D }
+
+  # ================================================================ Services
+  SvcA:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: svc-a
+      Cluster: !ImportValue { "Fn::Sub": "${Prefix}-ClusterName" }
+      TaskDefinition: !Ref TdAwsvpcFargate
+      DesiredCount: !Ref DesiredA
+      CapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+          SecurityGroups: [!ImportValue { "Fn::Sub": "${Prefix}-TaskSg" }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !ImportValue { "Fn::Sub": "${Prefix}-TgA" } }
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableECSManagedTags: true
+      EnableExecuteCommand: false
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: A }
+
+  SvcB1:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: svc-b1
+      Cluster: !ImportValue { "Fn::Sub": "${Prefix}-ClusterName" }
+      TaskDefinition: !Ref TdAwsvpcEc2
+      DesiredCount: !Ref DesiredB1
+      CapacityProviderStrategy: [{ CapacityProvider: !ImportValue { "Fn::Sub": "${Prefix}-CpB1" }, Weight: 1 }]
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+          SecurityGroups: [!ImportValue { "Fn::Sub": "${Prefix}-TaskSg" }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !ImportValue { "Fn::Sub": "${Prefix}-TgB1" } }
+      PlacementStrategies: [{ Type: spread, Field: instanceId }]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableECSManagedTags: true
+      EnableExecuteCommand: false
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: B1 }
+
+  SvcB2:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: svc-b2
+      Cluster: !ImportValue { "Fn::Sub": "${Prefix}-ClusterName" }
+      TaskDefinition: !Ref TdAwsvpcEc2
+      DesiredCount: !Ref DesiredB2
+      CapacityProviderStrategy: [{ CapacityProvider: !ImportValue { "Fn::Sub": "${Prefix}-CpB2" }, Weight: 1 }]
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!ImportValue { "Fn::Sub": "${Prefix}-PrivateSubnetA" }]
+          SecurityGroups: [!ImportValue { "Fn::Sub": "${Prefix}-TaskSg" }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !ImportValue { "Fn::Sub": "${Prefix}-TgB2" } }
+      PlacementStrategies: [{ Type: spread, Field: instanceId }]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableECSManagedTags: true
+      EnableExecuteCommand: false
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: B2 }
+
+  SvcC:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: svc-c
+      Cluster: !ImportValue { "Fn::Sub": "${Prefix}-ClusterName" }
+      TaskDefinition: !Ref TdBridge
+      DesiredCount: !Ref DesiredC
+      CapacityProviderStrategy: [{ CapacityProvider: !ImportValue { "Fn::Sub": "${Prefix}-CpC" }, Weight: 1 }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !ImportValue { "Fn::Sub": "${Prefix}-TgC" } }
+      PlacementStrategies: [{ Type: spread, Field: instanceId }]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableECSManagedTags: true
+      EnableExecuteCommand: false
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: C }
+
+  # host mode: the same host port cannot be used twice on one instance, so a rolling update
+  # with MinimumHealthyPercent=100 cannot place new tasks when every instance already runs one.
+  # 50 lets the normal deployment work. Scenario F-2 raises it to 100 on purpose.
+  SvcD:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: svc-d
+      Cluster: !ImportValue { "Fn::Sub": "${Prefix}-ClusterName" }
+      TaskDefinition: !Ref TdHost
+      DesiredCount: !Ref DesiredD
+      CapacityProviderStrategy: [{ CapacityProvider: !ImportValue { "Fn::Sub": "${Prefix}-CpD" }, Weight: 1 }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !ImportValue { "Fn::Sub": "${Prefix}-TgD" } }
+      PlacementStrategies: [{ Type: spread, Field: instanceId }]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableECSManagedTags: true
+      EnableExecuteCommand: false
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: NetMode, Value: D }
+
+  # ================================================================ Alarms (same set for every pattern)
+  Fn::ForEach::PatternAlarms:
+    - Pattern
+    - [A, B1, B2, C, D]
+    - "Alarm5xx${Pattern}":
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "${Prefix}-${Pattern}-target-5xx"
+          AlarmDescription: !Sub "Pattern ${Pattern}: target 5xx responses"
+          Namespace: AWS/ApplicationELB
+          MetricName: HTTPCode_Target_5XX_Count
+          Dimensions:
+            - { Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${Prefix}-AlbFullName" } }
+            - Name: TargetGroup
+              Value: !ImportValue
+                Fn::Sub:
+                  - "${Prefix}-${TgExport}"
+                  - TgExport: !FindInMap [Patterns, !Ref Pattern, TgExport]
+          Statistic: Sum
+          Period: 60
+          EvaluationPeriods: 2
+          Threshold: 10
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: notBreaching
+      "AlarmP99${Pattern}":
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "${Prefix}-${Pattern}-p99-latency"
+          AlarmDescription: !Sub "Pattern ${Pattern}: p99 target response time"
+          Namespace: AWS/ApplicationELB
+          MetricName: TargetResponseTime
+          Dimensions:
+            - { Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${Prefix}-AlbFullName" } }
+            - Name: TargetGroup
+              Value: !ImportValue
+                Fn::Sub:
+                  - "${Prefix}-${TgExport}"
+                  - TgExport: !FindInMap [Patterns, !Ref Pattern, TgExport]
+          ExtendedStatistic: p99
+          Period: 60
+          EvaluationPeriods: 3
+          Threshold: !Ref LatencyAlarmSeconds
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: notBreaching
+      "AlarmUnhealthy${Pattern}":
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "${Prefix}-${Pattern}-unhealthy-hosts"
+          AlarmDescription: !Sub "Pattern ${Pattern}: unhealthy targets"
+          Namespace: AWS/ApplicationELB
+          MetricName: UnHealthyHostCount
+          Dimensions:
+            - { Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${Prefix}-AlbFullName" } }
+            - Name: TargetGroup
+              Value: !ImportValue
+                Fn::Sub:
+                  - "${Prefix}-${TgExport}"
+                  - TgExport: !FindInMap [Patterns, !Ref Pattern, TgExport]
+          Statistic: Maximum
+          Period: 60
+          EvaluationPeriods: 2
+          Threshold: 0
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: notBreaching
+      "AlarmTaskShortfall${Pattern}":
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "${Prefix}-${Pattern}-running-below-desired"
+          AlarmDescription: !Sub "Pattern ${Pattern}: running task count below desired (Container Insights)"
+          Metrics:
+            - Id: running
+              ReturnData: false
+              MetricStat:
+                Metric:
+                  Namespace: ECS/ContainerInsights
+                  MetricName: RunningTaskCount
+                  Dimensions:
+                    - { Name: ClusterName, Value: !Ref Prefix }
+                    - { Name: ServiceName, Value: !FindInMap [Patterns, !Ref Pattern, Service] }
+                Period: 60
+                Stat: Minimum
+            - Id: desired
+              ReturnData: false
+              MetricStat:
+                Metric:
+                  Namespace: ECS/ContainerInsights
+                  MetricName: DesiredTaskCount
+                  Dimensions:
+                    - { Name: ClusterName, Value: !Ref Prefix }
+                    - { Name: ServiceName, Value: !FindInMap [Patterns, !Ref Pattern, Service] }
+                Period: 60
+                Stat: Maximum
+            - Id: shortfall
+              Expression: desired - running
+              Label: shortfall
+              ReturnData: true
+          EvaluationPeriods: 5
+          Threshold: 0
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: notBreaching
+
+Outputs:
+  TaskDefA:
+    Value: !Ref TdAwsvpcFargate
+  TaskDefB:
+    Value: !Ref TdAwsvpcEc2
+  TaskDefC:
+    Value: !Ref TdBridge
+  TaskDefD:
+    Value: !Ref TdHost
