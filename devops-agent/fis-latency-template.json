@@ -1,0 +1,38 @@
+{
+  "description": "netmode-lab F-4: add 200ms latency to ONE task of the target service",
+  "targets": {
+    "oneTask": {
+      "resourceType": "aws:ecs:task",
+      "parameters": {
+        "cluster": "<cluster-name>",
+        "service": "<service-name>"
+      },
+      "selectionMode": "COUNT(1)"
+    }
+  },
+  "actions": {
+    "latency": {
+      "actionId": "aws:ecs:task-network-latency",
+      "parameters": {
+        "duration": "PT10M",
+        "delayMilliseconds": "200",
+        "jitterMilliseconds": "10",
+        "flowsPercent": "100",
+        "useEcsFaultInjectionEndpoints": "true"
+      },
+      "targets": {
+        "Tasks": "oneTask"
+      }
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "aws:cloudwatch:alarm",
+      "value": "arn:aws:cloudwatch:<region>:<account-id>:alarm:<prefix>-<pattern>-target-5xx"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<account-id>:role/<least-privilege-fis-role>",
+  "tags": {
+    "Project": "netmode-lab"
+  }
+}
